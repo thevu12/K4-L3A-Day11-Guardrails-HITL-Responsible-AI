@@ -86,3 +86,34 @@ def test_results_schema_is_valid_jsonschema():
 
     schema = json.loads((ROOT / "schemas" / "results.schema.json").read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
+
+
+def test_red_advance_blocks_attacks_before_model_run():
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+
+    from google.genai import types
+
+    src = ROOT / "src"
+    sys.path.insert(0, str(src))
+    from agents.guards_agent import GuardsInputPlugin
+    from attacks.attacks import adversarial_prompts
+
+    plugin = GuardsInputPlugin()
+
+    async def check_inputs():
+        for attack in adversarial_prompts:
+            content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=attack["input"])],
+            )
+            result = await plugin.before_run_callback(
+                invocation_context=SimpleNamespace(user_content=content)
+            )
+            assert result is not None
+            assert result.role == "model"
+
+    asyncio.run(check_inputs())
+    assert plugin.total_count == len(adversarial_prompts)
+    assert plugin.blocked_count == len(adversarial_prompts)

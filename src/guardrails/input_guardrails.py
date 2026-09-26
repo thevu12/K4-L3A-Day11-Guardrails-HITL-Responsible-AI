@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,58 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+_ZERO_WIDTH = "\u200b\u200c\u200d\ufeff\u2060"
+_AMBIGUOUS_TOPICS = frozenset({"account", "transfer", "interest", "credit", "balance"})
+_BANKING_AMBIGUOUS_PAIRS = (
+    frozenset({"account", "balance"}),
+    frozenset({"account", "transfer"}),
+    frozenset({"account", "credit"}),
+    frozenset({"account", "interest"}),
+    frozenset({"credit", "balance"}),
+)
+_BANKING_CONTEXT = (
+    "bank",
+    "vinbank",
+    "money",
+    "funds",
+    "cash",
+    "vnd",
+    "card",
+    "bill",
+    "rate",
+    "score",
+    "statement",
+    "customer",
+    "merchant",
+    "mortgage",
+)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize user-controlled text before applying security rules."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = normalized.translate(str.maketrans("", "", _ZERO_WIDTH))
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _fold_for_topic(text: str) -> str:
+    """Case-fold and remove accents so Vietnamese topic terms still match."""
+    decomposed = unicodedata.normalize("NFKD", _normalize_text(text).casefold())
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def _contains_term(text: str, term: str) -> bool:
+    """Match a word or phrase without accepting partial-word collisions."""
+    folded_term = _fold_for_topic(term)
+    plural = r"s?" if folded_term.isascii() and " " not in folded_term and not folded_term.endswith("s") else ""
+    pattern = (
+        r"(?<!\w)"
+        + re.escape(folded_term).replace(r"\ ", r"\s+")
+        + plural
+        + r"(?!\w)"
+    )
+    return re.search(pattern, text) is not None
 
 
 # ============================================================
@@ -51,15 +104,52 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    injection_patterns = (
+        r"\bignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?\b",
+        r"\b(?:you\s+are|you're)\s+now\b",
+        r"\b(?:system|developer)\s+(?:prompt|instructions?)\b",
+        r"\b(?:reveal|show|disclose|print|repeat)\b.{0,60}\b(?:your|system|developer|hidden|internal|admin)\s+(?:instructions?|prompt|credentials?|password|api\s*key|note)\b",
+        r"\b(?:reveal|show|disclose|print|repeat|give|provide)\b.{0,60}\b(?:api\s*key|admin\s+password|database\s+(?:host|credentials?)|db\s+host|internal\s+(?:password|credentials?|note))\b",
+        r"\b(?:reveal|show|disclose|print|repeat|give|provide)\b.{0,40}\bpassword\b.{0,40}\b(?:admin|system|internal|database)\b",
+        r"\bpretend\s+(?:that\s+)?you\s+are\b",
+        r"\bact\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|unfiltered|uncensored)\b",
+        r"\b(?:bypass|override|disregard)\b.{0,60}\b(?:rules?|policy|instructions?|guardrails?)\b",
+        r"\bbo\s+qua\b.{0,50}\b(?:huong\s+dan|chi\s+thi|quy\s+tac)\b",
+        r"\btiet\s+lo\b.{0,50}\b(?:mat\s+khau|api|thong\s+tin\s+noi\s+bo)\b",
+    )
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    normalized = _fold_for_topic(user_input)
+
+    for pattern in injection_patterns:
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
+
+    safe_password_help_pattern = re.compile(
+        r"\b(?:show|give|provide)\b(?:\s+\w+){0,4}\s+password\s+"
+        r"(?:(?:reset|change|recovery)\s+)?"
+        r"(?:instructions?|help|policy|requirements?)\b|"
+        r"\b(?:show|give|provide)\b.{0,30}\bhow\s+to\s+"
+        r"(?:reset|change|recover)\b.{0,20}\bpassword\b",
+        re.IGNORECASE,
+    )
+    safe_spans = list(safe_password_help_pattern.finditer(normalized))
+    remaining = normalized
+    for match in reversed(safe_spans):
+        remaining = remaining[:match.start()] + " " * (match.end() - match.start()) + remaining[match.end():]
+
+    credential_request = re.search(
+        r"\b(?:reveal|show|disclose|print|repeat|give|provide)\b.{0,80}"
+        r"\b(?:password|credentials?|api\s*key|database\s+host|db\s+host)\b",
+        remaining,
+        re.IGNORECASE,
+    )
+    other_secret_label = re.search(
+        r"\b(?:credentials?|api\s*key|database\s+host|db\s+host)\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if credential_request or (safe_spans and other_secret_label):
+        return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +174,30 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    normalized = _fold_for_topic(user_input)
+    if any(_contains_term(normalized, topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+    accent_preserved = _normalize_text(user_input).casefold()
+    matched_topics = set()
+    for topic in ALLOWED_TOPICS:
+        if topic == "vay":
+            if re.search(r"(?<!\w)vay(?!\w)", accent_preserved):
+                matched_topics.add(topic)
+        elif _contains_term(normalized, topic):
+            matched_topics.add(topic)
+    if not matched_topics:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
-
-    pass  # Replace with your implementation
+    ambiguous_matches = matched_topics.intersection(_AMBIGUOUS_TOPICS)
+    if matched_topics - _AMBIGUOUS_TOPICS:
+        return "ALLOW"
+    if any(pair.issubset(ambiguous_matches) for pair in _BANKING_AMBIGUOUS_PAIRS):
+        return "ALLOW"
+    if re.search(r"\b(?:my|our)\s+(?:accounts?|balance)\b", normalized):
+        return "ALLOW"
+    if any(_contains_term(normalized, term) for term in _BANKING_CONTEXT):
+        return "ALLOW"
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +250,19 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Input blocked: a prompt-injection attempt was detected."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Input blocked: VinBank can only help with safe banking topics."
+            )
+
+        return None
 
 
 # ============================================================

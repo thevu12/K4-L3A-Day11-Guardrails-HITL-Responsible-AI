@@ -182,11 +182,12 @@ class GuardsInputPlugin(base_plugin.BasePlugin):
     def _block(self, message: str) -> types.Content:
         return types.Content(role="model", parts=[types.Part.from_text(text=message)])
 
-    async def on_user_message_callback(
-        self, *, invocation_context: InvocationContext, user_message: types.Content
+    async def before_run_callback(
+        self, *, invocation_context: InvocationContext
     ) -> types.Content | None:
+        """Stop the run before Gemini when deterministic input checks reject it."""
         self.total_count += 1
-        text = self._text(user_message)
+        text = self._text(invocation_context.user_content)
         if detect_injection_strong(text):
             self.blocked_count += 1
             return self._block(
